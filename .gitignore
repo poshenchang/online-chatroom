@@ -30,10 +30,3 @@
 *.exe
 *.out
 *.app
-
-# Demo videos
-*.webm
-*.mp4
-
-/backup
-*.zip
