@@ -19,7 +19,7 @@ The server acts as a central hub that relays and process messages in between cli
 2. Compile the server and client
 
 ```bash
-cd online-chatroom
+cd online-chatroom/code
 make
 ```
 
