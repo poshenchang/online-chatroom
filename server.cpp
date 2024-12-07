@@ -9,12 +9,15 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <pthread.h>
 #include <unistd.h>
 #include <err.h>
 #include <iostream>
 #include <sstream>
 #include <vector>
+#include <queue>
 #include <map>
+#include <cstdlib>
 #include <cstring>
 #include <cctype>
 #include <csignal>
@@ -23,6 +26,7 @@ using namespace std;
 
 #define BUFFERSIZE 1024
 #define MAXCMDARG 3
+#define MAXWORKERS 10
 
 // Function prototypes
 
@@ -46,8 +50,10 @@ class Client{
     public:
         string host;                // client's host
         int connect_fd;             // fd to talk with client
+        string username;            // username of client connection
         string buf;                 // data sent by/to client
         size_t buf_len;             // bytes used by buf
+        bool login;
         bool alive;
 
         Client(){}
@@ -57,11 +63,17 @@ class Client{
 Client::Client(string host, int fd){
     this->host = host;
     this->connect_fd = fd;
+    this->username.clear();
     this->buf_len = 0;
+    this->login = false;
     this->alive = true;
 }
 
-enum status{ONLINE, OFFLINE, IDLE};
+enum status{
+    ONLINE,
+    OFFLINE,
+    IDLE
+};
 
 // User
 
@@ -103,7 +115,7 @@ void UserDB::userRegister(string username, string password){
 
 bool UserDB::userLogin(string username, string password){
     cerr << "check password " << password << endl;
-    if(reg[username].password == password){
+    if(reg[username].password == password && reg[username].stat == OFFLINE){
         reg[username].stat = ONLINE;
         return true;
     }
@@ -124,8 +136,10 @@ int listen_fd;
 unsigned short port;
 // stores data of ongoing clients
 map<int, Client> req;
+pthread_mutex_t reqMutex = PTHREAD_MUTEX_INITIALIZER;
 // stores data of registered users
 UserDB userDatabase;
+pthread_mutex_t userMutex = PTHREAD_MUTEX_INITIALIZER;
 
 void signalHandler(int signo) {
     if(signo == SIGPIPE){
@@ -229,21 +243,43 @@ string receiveString(int socket_fd){
     return str;
 }
 
-int main(int argc, char** argv) {
-    // Parse args
-    if(argc != 2){
-        cerr << "Usage: " << argv[0] << " [port]" << endl;
-        exit(1);
-    }
+// Task type
+enum taskType{
+    CHECKUSER,
+    REGISTER,
+    LOGIN,
+    LOGOUT,
+    EXIT
+};
 
-    // Signal handler
-    signal(SIGPIPE, SIG_IGN);
+// Task structure
+struct Task{
+    int client_fd;
+    taskType type;
+    map<string, string> arg;
+};
 
-    // Initialize server
-    initServer((unsigned short) stoi(argv[1]));
+// Task queue
+queue<Task> taskQueue;
+pthread_mutex_t queueMutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t taskAvailable = PTHREAD_COND_INITIALIZER;
 
+// Worker thread function
+void* worker_thread(void* arg){
     while(true){
-        int connect_fd = acceptConnection();
+        Task task;
+
+        pthread_mutex_lock(&queueMutex);
+        while(taskQueue.empty()){
+            pthread_cond_wait(&taskAvailable, &queueMutex);
+        }
+        task = taskQueue.front();
+        taskQueue.pop();
+        pthread_mutex_unlock(&queueMutex);
+
+        int connect_fd = task.client_fd;
+        cout << "Worker " << pthread_self() << " handling client " << task.client_fd << endl;
+
         bool exit = false;
         while(!exit){
             string currentUser = "";
@@ -289,6 +325,42 @@ int main(int argc, char** argv) {
         }
         closeConnection(connect_fd);
     }
+    return nullptr;
+}
 
+int main(int argc, char** argv) {
+    // Parse args
+    if(argc != 2){
+        cerr << "Usage: " << argv[0] << " [port]" << endl;
+        exit(1);
+    }
+
+    // Signal handler
+    signal(SIGPIPE, SIG_IGN);
+
+    // Initialize server
+    initServer((unsigned short) stoi(argv[1]));
+
+    // Create worker threads
+    pthread_t workers[MAXWORKERS];
+    for(int i=0; i<MAXWORKERS; ++i){
+        if(pthread_create(&workers[i], nullptr, worker_thread, nullptr) < 0){
+            cerr << "Failed to create worker thread" << endl;
+        }
+    }
+
+    while(true){
+        int connect_fd = acceptConnection();
+        cout << "New client connected, fd " << connect_fd << endl;
+
+        // Add task to task queue
+        Task task = {connect_fd};
+        pthread_mutex_lock(&queueMutex);
+        taskQueue.push(task);
+        pthread_cond_signal(&taskAvailable);
+        pthread_mutex_unlock(&queueMutex);
+    }
+    
+    close(listen_fd);
     return 0;
 }

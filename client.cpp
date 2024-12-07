@@ -215,7 +215,7 @@ int main(int argc, char** argv){
                 cout << "Successfully login!" << endl;
                 currentUser = username;
             }
-            else cout << "Login failed." << endl;
+            else cout << "Login failed. Wrong password or user already logged in at another session." << endl;
         }
         else if(cmd == "logout"){
             if(currentUser.empty()){
