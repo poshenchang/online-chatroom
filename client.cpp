@@ -354,7 +354,6 @@ int main(int argc, char** argv){
         cout << cmd_prompt;
         while(!(cin >> cmd)){
             cin.clear();
-            // cin.ignore(INT_MAX, '\n');
         }
         strToLower(cmd);
         if(cmd == "help"){
@@ -384,8 +383,7 @@ int main(int argc, char** argv){
             if(isSuccess()){
                 cout << "Successfully registered!" << endl;
             }
-            else cout << "Register failed." << endl;
-            
+            else cout << "Register failed." << endl;   
         }
         else if(cmd == "login"){
             if(!currentUser.empty()){
@@ -424,7 +422,7 @@ int main(int argc, char** argv){
             }
             else cout << "Logout failed." << endl;
         }
-        else if(cmd == "message" || "msg"){
+        else if(cmd == "message" || cmd == "msg"){
             // Check if logged in
             if(currentUser.empty()){
                 cout << "You are not currently logged in. Please log in first." << endl;
@@ -491,7 +489,6 @@ int main(int argc, char** argv){
             else{
                 cout << "Hello, guest! Welcome to the chatroom!" << endl;
             }
-            
         }
         else if(cmd == "exit"){
             sendString(socket_fd, "exit\n");
