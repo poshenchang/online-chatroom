@@ -24,7 +24,7 @@ using namespace std;
 
 #define BUFFERSIZE 1024
 #define MAXCMDARG 3
-#define MAXWORKERS 10
+#define MAXWORKERS 30
 #define MAXWAITTIME 60
 
 // Function prototypes
