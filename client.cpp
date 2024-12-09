@@ -54,6 +54,7 @@ const string exit_msg = "Session ended.\n"
 // file descriptor for communicating with server
 int socket_fd;
 FILE* server_fp;
+unsigned short listen_port;
 int listen_fd;
 
 // SIGTSTP flag
@@ -99,7 +100,7 @@ static int connectServer(const char* serverIP, const unsigned short portnum){
     return 0;
 }
 
-static int setupListen(const unsigned short portnum){
+static int setupListen(){
     struct sockaddr_in clientAddr;
     int tmp;
 
@@ -115,16 +116,19 @@ static int setupListen(const unsigned short portnum){
     memset(&clientAddr, 0, sizeof(clientAddr));
     clientAddr.sin_family = AF_INET;
     clientAddr.sin_addr.s_addr = htonl(INADDR_ANY);
-    clientAddr.sin_port = htons(portnum);
+    clientAddr.sin_port = htons(0);
     tmp = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, (void*)&tmp, sizeof(tmp));
     bind(listen_fd, (struct sockaddr*)&clientAddr, sizeof(clientAddr));
     listen(listen_fd, 1024);
 
     // tell server the listening port
-    sendString(socket_fd, to_string(portnum));
+    socklen_t len = sizeof(clientAddr);
+    getsockname(listen_fd, (struct sockaddr*)&clientAddr, &len);
+    listen_port = ntohs(clientAddr.sin_port);
+    sendString(socket_fd, to_string(listen_port));
 
-    cerr << "listening on port "<< portnum << endl;
+    cerr << "listening on port "<< listen_port << endl;
     return 0;
 }
 
@@ -316,14 +320,14 @@ void strToLower(string& str){
 }
 
 int main(int argc, char** argv){
-    if(argc != 4){
-        cerr << "Usage: " << argv[0] << " [server IP address] [server port] [client port]" << endl;
+    if(argc != 3){
+        cerr << "Usage: " << argv[0] << " [server IP address] [server port]" << endl;
         exit(1);
     }
 
     // Initialize socket and connect to server
     connectServer(argv[1], strToInt(argv[2]));
-    setupListen(strToInt(argv[3]));
+    setupListen();
     server_fp = fdopen(socket_fd, "a+");
     setbuf(server_fp, NULL);
 
