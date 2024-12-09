@@ -4,8 +4,11 @@ A simple online chatroom implemented using C++ with socket programming. This pro
 
 The server acts as a central hub that relays and process messages in between clientts. The server listens for new connections, register users and authenticates clients, and maintains list of connected clients and user database. Each client application handles its own UI and user input. The client onlny sends messages to the server when necessary, and receives messages from the server, which it then displays locally.
 
-> [!WARNING]
-> The application currently supports only one concurrent client at a time.
+## Features
+
+* User authentication(registration, login, logout)
+* Multithread server: supports up to 20 concurrent connections
+* Peer-to-peer messaging: messages are sent directly from client to client without passing through server
 
 ## Prerequisites
 
@@ -30,7 +33,7 @@ make
 
 4. Start a client with the server's IP address and port
 ```bash
-./client <server-ip> <port>
+./client <server-ip> <server-port>
 ```
 
 ## Commands
@@ -40,8 +43,9 @@ make
 * `login`: Log in with a unique username.
 * `logout`: Log out from account.
 * `hello`/`hi`:  Say hi to the server!
+* `message`/`msg`: Message other users.
 * `exit`: Exit session.
 
-## Limitations
+## Limitations and future improvements
 
 Currently, messages are transmitted in plain text. File transfer or multimedia are not (yet) supported. Future improvements could include message encryption, enhanced authentication, and a GUI for a more user-friendly experience.
