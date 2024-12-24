@@ -1,10 +1,11 @@
-// TODO: Message encryption with OpenSSL
 // TODO: File tranfer
 // TODO: Audio streaming
 
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <err.h>
@@ -58,19 +59,20 @@ class Client{
     public:
         string host;                // client's host
         int connect_fd;             // fd to talk with client
+        SSL* ssl;                   // ssl of client connection
         string listen_port;         // listening port of client
         string username;            // username of client connection
         bool login;
         bool alive;
 
         Client(){}
-        Client(string host, int fd, string portnum);
+        Client(string host, int fd, SSL* ssl);
 };
 
-Client::Client(string host, int fd, string portnum){
+Client::Client(string host, int fd, SSL* ssl){
     this->host = host;
     this->connect_fd = fd;
-    this->listen_port = portnum;
+    this->ssl = ssl;
     this->username.clear();
     this->login = false;
     this->alive = true;
@@ -261,9 +263,46 @@ void signalHandler(int signo) {
     exit(EXIT_FAILURE);
 }
 
+// OpenSSL
+
+const char* private_key_path = "./key.pem";
+const char* certificate_path = "./cert.pem";
+SSL_CTX* server_ctx;
+
+void init_openssl(){
+    SSL_load_error_strings();
+    OpenSSL_add_ssl_algorithms();
+    SSL_library_init();
+}
+
+SSL_CTX* create_context() {
+    SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+    if (!ctx) {
+        perror("Unable to create SSL context");
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+    return ctx;
+}
+
+void configure_context(SSL_CTX *ctx) {
+    if (SSL_CTX_use_certificate_file(server_ctx, certificate_path, SSL_FILETYPE_PEM) <= 0 ||
+        SSL_CTX_use_PrivateKey_file(server_ctx, private_key_path, SSL_FILETYPE_PEM) <= 0) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+}
+
+// network socket
+
 static int initServer(const unsigned short portnum){
     struct sockaddr_in serverAddr;
     int tmp;
+
+    // init openssl
+    init_openssl();
+    server_ctx = create_context();
+    configure_context(server_ctx);
 
     char namebuf[512];
     gethostname(namebuf, sizeof(namebuf));
@@ -307,34 +346,54 @@ int acceptConnection(){
         cerr << "Cannot accept client connection" << endl;
     }
 
+    // openssl
+    SSL *ssl = SSL_new(server_ctx);
+    SSL_set_fd(ssl, connect_fd);
+    if(SSL_accept(ssl) != 1){
+        cerr << "SSL accept failed" << endl;
+        ERR_print_errors_fp(stderr);
+    }
+
     // initialize new Client
     string client_host = inet_ntoa(cliaddr.sin_addr);
+    pthread_rwlock_wrlock(&reqRWLock);
+    req.insert(make_pair(connect_fd, Client(client_host, connect_fd, ssl)));
+    pthread_rwlock_unlock(&reqRWLock);
     string portnum = receiveString(connect_fd);
     pthread_rwlock_wrlock(&reqRWLock);
-    req.insert(make_pair(connect_fd, Client(client_host, connect_fd, portnum)));
+    req[connect_fd].listen_port = portnum;
     pthread_rwlock_unlock(&reqRWLock);
     cout << "New client from " << client_host << ", client listening on " << portnum << endl;
     return connect_fd;
 }
 
 int closeConnection(int fd){
-    pthread_rwlock_rdlock(&reqRWLock);
+    pthread_rwlock_wrlock(&reqRWLock);
     Client cli = req[fd];
-    pthread_rwlock_unlock(&reqRWLock);
 
     close(cli.connect_fd);
     cerr << "closed connection with " << cli.host << endl;
-
-    pthread_rwlock_wrlock(&reqRWLock);
+    
+    SSL_shutdown(req[fd].ssl);
+    SSL_free(req[fd].ssl);
     req.erase(fd);
     pthread_rwlock_unlock(&reqRWLock);
 
     return 0;
 }
 
+void cleanupServer(){
+    close(listen_fd);
+    SSL_CTX_free(server_ctx);
+    EVP_cleanup();
+}
+
 // write std::string to file descriptor
 void sendString(int socket_fd, string msg){
-    ssize_t nbytes = send(socket_fd, msg.c_str(), msg.size(), 0);
+    pthread_rwlock_rdlock(&reqRWLock);
+    SSL* ssl = req[socket_fd].ssl;
+    pthread_rwlock_unlock(&reqRWLock);
+    ssize_t nbytes = SSL_write(ssl, msg.c_str(), msg.size());
     if(nbytes == -1){
         cerr << "Failed to send message" << endl;
         if(errno == EPIPE){
@@ -350,7 +409,10 @@ void sendString(int socket_fd, string msg){
 string receiveString(int socket_fd){
     char buf[BUFFERSIZE];
     string str;
-    ssize_t nbytes = recv(socket_fd, buf, BUFFERSIZE, 0);
+    pthread_rwlock_rdlock(&reqRWLock);
+    SSL* ssl = req[socket_fd].ssl;
+    pthread_rwlock_unlock(&reqRWLock);
+    ssize_t nbytes = SSL_read(ssl, buf, BUFFERSIZE);
     if(nbytes == -1){
         cerr << "Failed to receive message" << endl;
     }
@@ -397,6 +459,7 @@ void* worker_thread(void* arg){
 
         pthread_mutex_lock(&queueMutex);
         while(taskQueue.empty()){
+            // cerr << "thread " << pthread_self() << "waiting for request..." << endl;
             pthread_cond_wait(&taskAvailable, &queueMutex);
         }
         task = taskQueue.front();
@@ -538,6 +601,6 @@ int main(int argc, char** argv) {
         pthread_mutex_unlock(&queueMutex);
     }
     
-    close(listen_fd);
+    cleanupServer();
     return 0;
 }

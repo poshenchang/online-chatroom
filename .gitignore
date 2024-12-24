@@ -35,4 +35,7 @@
 *.webm
 *.mp4
 
+# OpenSSL
+*.pem
+
 /backup

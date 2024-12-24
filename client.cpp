@@ -1,10 +1,11 @@
-// TODO: Message encryption with OpenSSL
 // TODO: File tranfer
 // TODO: Audio streaming
 
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 #include <unistd.h>
 #include <err.h>
 #include <iostream>
@@ -24,8 +25,8 @@ using namespace std;
 
 // Function prototypes
 
-void sendString(int socket_fd, string msg);
-string receiveString(int socket_fd);
+void sendString(string msg);
+string receiveString();
 
 // Messages
 
@@ -67,6 +68,62 @@ void signalHandler(int signo){
     }
 }
 
+// OpenSSL
+
+SSL_CTX* server_ctx;
+SSL_CTX* client_ctx;
+SSL* server_ssl;
+const char* private_key_path = "./key.pem";
+const char* certificate_path = "./cert.pem";
+
+void init_openssl(){
+    SSL_load_error_strings();
+    OpenSSL_add_ssl_algorithms();
+    SSL_library_init();
+}
+
+SSL_CTX* create_context(string type) {
+    SSL_CTX *ctx;
+    if(type == "server")
+        ctx = SSL_CTX_new(TLS_server_method());
+    else if(type == "client")
+        ctx = SSL_CTX_new(TLS_client_method());
+    else return NULL;
+
+    if (!ctx) {
+        perror("Unable to create SSL context");
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+    return ctx;
+}
+
+void configure_context(SSL_CTX *ctx) {
+    if (SSL_CTX_use_certificate_file(server_ctx, certificate_path, SSL_FILETYPE_PEM) <= 0 ||
+        SSL_CTX_use_PrivateKey_file(server_ctx, private_key_path, SSL_FILETYPE_PEM) <= 0) {
+        ERR_print_errors_fp(stderr);
+        exit(EXIT_FAILURE);
+    }
+}
+
+void ssl_print_error(int err){
+    if(err == SSL_ERROR_ZERO_RETURN){
+        cerr << "SSL_ERROR_ZERO_RETURN" << endl;
+    }
+    else if(err == SSL_ERROR_WANT_READ){
+        cerr << "SSL_ERROR_WANT_READ" << endl;
+    }
+    else if(err == SSL_ERROR_WANT_WRITE){
+        cerr << "SSL_ERROR_WANT_WRITE" << endl;
+    }
+    else if(err == SSL_ERROR_SYSCALL){
+        cerr << "SSL_ERROR_SYSCALL" << endl;
+    }
+    else if(err == SSL_ERROR_SSL){
+        cerr << "SSL_ERROR_SSL" << endl;
+    }
+}
+
 // Initialize socket and connect to server
 static int connectServer(const char* serverIP, const unsigned short portnum){
     struct sockaddr_in serverAddr;
@@ -75,7 +132,7 @@ static int connectServer(const char* serverIP, const unsigned short portnum){
     socket_fd = socket(AF_INET, SOCK_STREAM, 0);
     if(socket_fd < 0){
         cerr << "Error creating socket" << endl;
-        return -1;
+        exit(-1);
     }
 
     // Set up the server address structure
@@ -86,15 +143,30 @@ static int connectServer(const char* serverIP, const unsigned short portnum){
         cerr << serverIP << endl;
         cerr << "Invalid Address" << endl;
         close(socket_fd);
-        return -1;
+        exit(-1);
     }
 
     // Connect to the server
     if(connect(socket_fd, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0){
         cerr << "Connection Failed" << endl;
         close(socket_fd);
-        return -1;
+        exit(-1);
     }
+
+    // Setup OpenSSL
+    init_openssl();
+    client_ctx = create_context("client");
+    server_ctx = create_context("server");
+    configure_context(server_ctx);
+    server_ssl = SSL_new(client_ctx);
+    SSL_set_fd(server_ssl, socket_fd);
+    if (SSL_connect(server_ssl) != 1) {
+        cerr << "SSL connect failed" << endl;
+        ERR_print_errors_fp(stderr);
+        exit(-1);
+    }
+    // SSL_write(server_ssl, "test message\n", 13);
+
     cout << "Connected to server at " << serverIP << ":" << portnum << endl;
 
     return 0;
@@ -110,7 +182,7 @@ static int setupListen(){
     listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if(listen_fd < 0){
         cerr << "Error creating socket" << endl;
-        return -1;
+        exit(-1);
     }
 
     memset(&clientAddr, 0, sizeof(clientAddr));
@@ -126,10 +198,19 @@ static int setupListen(){
     socklen_t len = sizeof(clientAddr);
     getsockname(listen_fd, (struct sockaddr*)&clientAddr, &len);
     listen_port = ntohs(clientAddr.sin_port);
-    sendString(socket_fd, to_string(listen_port));
+    sendString(to_string(listen_port) + '\n');
 
     cerr << "listening on port "<< listen_port << endl;
     return 0;
+}
+
+void cleanupClient(){
+    SSL_shutdown(server_ssl);
+    SSL_free(server_ssl);
+    close(socket_fd);
+    SSL_CTX_free(client_ctx);
+    SSL_CTX_free(server_ctx);
+    EVP_cleanup();
 }
 
 // direct modes messaging
@@ -137,13 +218,13 @@ static int setupListen(){
 pthread_t tid_send, tid_recv;
 
 struct msg_struct{
-    int socket_fd;
+    SSL* ssl;
     string username;
 };
 
 void* sendMessage(void* args){
     struct msg_struct* msg_args = (struct msg_struct*)args;
-    int socket_fd = msg_args->socket_fd;
+    SSL* client_ssl = msg_args->ssl;
     string username = msg_args->username;
 
     string message;
@@ -156,7 +237,7 @@ void* sendMessage(void* args){
             interrupted.store(false);
             break;
         }
-        if (send(socket_fd, message.c_str(), message.size(), 0) <= 0) break;
+        if (SSL_write(client_ssl, message.c_str(), message.size()) <= 0) break;
     }
     pthread_cancel(tid_recv);
     return nullptr;
@@ -164,12 +245,12 @@ void* sendMessage(void* args){
 
 void* receiveMessage(void* args){
     struct msg_struct* msg_args = (struct msg_struct*)args;
-    int socket_fd = msg_args->socket_fd;
+    SSL* client_ssl = msg_args->ssl;
     string username = msg_args->username;
 
     char buf[1024];
     while(true){
-        ssize_t nbytes = recv(socket_fd, buf, sizeof(buf)-1, 0);
+        ssize_t nbytes = SSL_read(client_ssl, buf, sizeof(buf)-1);
         // exit when remote disconnects
         if(nbytes <= 0){
             cout << "User " << username << " has left." << endl;
@@ -184,6 +265,7 @@ void* receiveMessage(void* args){
 
 static int directMessage(string username, bool init, string remoteHost, string remotePort){
     int msg_fd;
+    SSL* client_ssl;
     if(init){
         struct sockaddr_in cliAddr;
         unsigned short portnum = stoi(remotePort);
@@ -193,7 +275,7 @@ static int directMessage(string username, bool init, string remoteHost, string r
             cerr << "Error creating socket" << endl;
             return -1;
         }
-        // Set up the server address structure
+        // Setup the client address structure
         memset(&cliAddr, 0, sizeof(cliAddr));
         cliAddr.sin_family = AF_INET;
         cliAddr.sin_port = htons(portnum);
@@ -203,11 +285,17 @@ static int directMessage(string username, bool init, string remoteHost, string r
             close(msg_fd);
             return -1;
         }
-        // Connect to the server
+        // Connect to the remote client
         if(connect(msg_fd, (struct sockaddr*)&cliAddr, sizeof(cliAddr)) < 0){
             cerr << "Connection Failed" << endl;
             close(msg_fd);
             return -1;
+        }
+        // Setup OpenSSL
+        client_ssl = SSL_new(client_ctx);
+        SSL_set_fd(client_ssl, msg_fd);
+        if(SSL_connect(client_ssl) <= 0){
+            ERR_print_errors_fp(stderr);
         }
     }
     else{
@@ -220,6 +308,12 @@ static int directMessage(string username, bool init, string remoteHost, string r
             if(errno == EINTR || errno == EAGAIN) return -1;  // try again
             cerr << "Cannot accept client connection" << endl;
         }
+        // Setup OpenSSL
+        client_ssl = SSL_new(server_ctx);
+        SSL_set_fd(client_ssl, msg_fd);
+        if(SSL_accept(client_ssl) <= 0){
+            ERR_print_errors_fp(stderr);
+        }
     }
 
     // clear cin buffer
@@ -229,52 +323,65 @@ static int directMessage(string username, bool init, string remoteHost, string r
     cout << "Enjoy your time!\n"
             "------------------------------------" << endl;
     
-    struct msg_struct *args =(struct msg_struct*)malloc(sizeof(struct msg_struct));
-    args->socket_fd = msg_fd;
+    msg_struct *args = new msg_struct;
+    args->ssl = client_ssl;
     args->username = username;
     pthread_create(&tid_send, NULL, sendMessage, args);
     pthread_create(&tid_recv, NULL, receiveMessage, args);
     
     // cleanup
     pthread_join(tid_recv, NULL);
+    SSL_shutdown(client_ssl);
+    SSL_free(client_ssl);
     close(msg_fd);
     pthread_join(tid_send, NULL);
+    delete args;
     cout << "------------------------------------" << endl;
     return 0;
 }
 
-// write std::string to file pointer
-int sendLine(FILE* fp, string msg){
-    return fprintf(fp, "%s\n", msg.c_str());
-}
-
-// read std::string from file pointer
-int receiveLine(FILE* fp, string &msg){
-    char* buf = NULL; size_t len;
-    int nbytes = getline(&buf, &len, fp);
-    if(nbytes > 0){
-        msg = buf;
-        if(msg[nbytes-1] == '\n') msg.pop_back();
+// read std::string from server_ssl
+string receiveLine() {
+    string line;
+    char buffer[1];
+    while (true) {
+        int bytes_read = SSL_read(server_ssl, buffer, 1);
+        if (bytes_read > 0) {
+            // Append the character to the line
+            line += buffer[0];
+            // Stop if a newline is found
+            if (buffer[0] == '\n') {
+                line.pop_back();
+                break;
+            }
+        } else {
+            int error = SSL_get_error(server_ssl, bytes_read);
+            if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) {
+                continue; // Retry on non-blocking mode
+            } else {
+                throw runtime_error("SSL_read error or connection closed");
+            }
+        }
     }
-    free(buf);
-    return nbytes;
+    return line;
 }
 
 // write std::string to file descriptor
-void sendString(int fd, string msg){
-    ssize_t nbytes = send(fd, msg.c_str(), msg.length(), 0);
-    if(nbytes == -1){
-        perror("send");
+void sendString(string msg){
+    ssize_t ret = SSL_write(server_ssl, msg.c_str(), msg.length());
+    if(ret <= 0){
+        int err = SSL_get_error(server_ssl, ret);
+        ssl_print_error(err);
     }
 }
 
 // read std::string from file descriptor
-string receiveString(int fd){
+string receiveString(){
     char buf[BUFFERSIZE];
     string str;
-    ssize_t nbytes = recv(fd, buf, BUFFERSIZE, 0);
-    if(nbytes == -1){
-        perror("send");
+    ssize_t nbytes = SSL_read(server_ssl, buf, BUFFERSIZE);
+    if(nbytes <= 0){
+        ERR_print_errors_fp(stderr);
     }
     else if(nbytes > 0){
         str.append(buf, nbytes);
@@ -300,7 +407,7 @@ bool passwordValid(string str){
 }
 
 bool isSuccess(){
-    string str = receiveString(socket_fd);
+    string str = receiveString();
     return (str == "SUCCESS");
 }
 
@@ -346,9 +453,8 @@ int main(int argc, char** argv){
     while(!exit){
         // check for pending message requests
         if(!currentUser.empty()){
-            sendLine(server_fp, "msgNum");
-            string buf;
-            receiveLine(server_fp, buf);
+            sendString("msgNum\n");
+            string buf = receiveLine();
             int numReq = stoi(buf);
             if(numReq > 0){
                 cout << "[Notification] You have " << numReq << " pending message requests. Type 'message' to enter chatroom.\n";
@@ -371,7 +477,7 @@ int main(int argc, char** argv){
                 cin >> username;
                 if(!usernameValid(username)) cout << "Invalid username. Try another one." << endl;
                 else{
-                    sendString(socket_fd, "checkuser " + username + '\n');
+                    sendString("checkuser " + username + '\n');
                     if(isSuccess()) cout << "Username already taken. Try another one." << endl;
                     else break;
                 }
@@ -383,7 +489,7 @@ int main(int argc, char** argv){
                 if(!usernameValid(password)) cout << "Invalid password. Try another one." << endl;
                 else break;
             }
-            sendString(socket_fd, "register " + username + " " + password + '\n');
+            sendString("register " + username + " " + password + '\n');
             if(isSuccess()){
                 cout << "Successfully registered!" << endl;
             }
@@ -398,7 +504,7 @@ int main(int argc, char** argv){
             // Enter username
             cout << "Enter your username: ";
             cin >> username;
-            sendString(socket_fd, "checkuser " + username + '\n');
+            sendString("checkuser " + username + '\n');
             if(!isSuccess()){
                 cout << "User does not exist." << endl;
                 continue;
@@ -406,7 +512,7 @@ int main(int argc, char** argv){
             // Enter password
             cout << "Enter your password: ";
             cin >> password;
-            sendString(socket_fd, "login " + username + ' ' + password + '\n');
+            sendString("login " + username + ' ' + password + '\n');
             if(isSuccess()){
                 cout << "Successfully login!" << endl;
                 currentUser = username;
@@ -419,7 +525,7 @@ int main(int argc, char** argv){
                 cout << "You are not currently logged in. Please log in first." << endl;
                 continue;
             }
-            sendString(socket_fd, "logout\n");
+            sendString("logout\n");
             if(isSuccess()){
                 cout << "Successfully logout!" << endl;
                 currentUser = "";
@@ -433,15 +539,14 @@ int main(int argc, char** argv){
                 continue;
             }
             // get pending message requests
-            sendLine(server_fp, "msgReq");
+            sendString("msgReq\n");
             set<string> reqSet;
-            string buf;
-            receiveLine(server_fp, buf);
+            string buf = receiveLine();
             int numReq = stoi(buf);
             if(numReq > 0){
                 cout << "Pending message requests from:" << endl;
                 for(int i=0; i<numReq; i++){
-                    receiveLine(server_fp, buf);
+                    buf = receiveLine();
                     reqSet.insert(buf);
                     cout << "* " << buf << endl;
                 }
@@ -458,7 +563,7 @@ int main(int argc, char** argv){
             // Check if user is in pending requests
             if(reqSet.count(username)){
                 // accept message
-                sendLine(server_fp, "accept " + username);
+                sendString("accept " + username + '\n');
                 if(!isSuccess()){
                     cout << "Message request from " << username << " expired." << endl;
                 }
@@ -467,22 +572,21 @@ int main(int argc, char** argv){
             }
             else{
                 // Check if user exists
-                sendString(socket_fd, "checkuser " + username + '\n');
+                sendString("checkuser " + username + '\n');
                 if(!isSuccess()){
                     cout << "User does not exist." << endl;
                     continue;
                 }
                 // Send message request
-                sendString(socket_fd, "connect " + username + '\n');
+                sendString("connect " + username + '\n');
                 cout << "Connecting to " << username << ", request pending..." << endl;
                 if(!isSuccess()){
                     cout << "Request failed. User offline or request timeout." << endl;
                     continue;
                 }
                 // get client IP and portnum
-                string remoteHost, remotePort;
-                receiveLine(server_fp, remoteHost);
-                receiveLine(server_fp, remotePort);
+                string remoteHost = receiveLine();
+                string remotePort = receiveLine();
                 directMessage(username, true, remoteHost, remotePort);
             }            
         }
@@ -495,7 +599,7 @@ int main(int argc, char** argv){
             }
         }
         else if(cmd == "exit"){
-            sendString(socket_fd, "exit\n");
+            sendString("exit\n");
             exit = true;
         }
         else{
@@ -503,7 +607,7 @@ int main(int argc, char** argv){
         }
     }
     cout << exit_msg;
-    close(socket_fd);
+    cleanupClient();
 
     return 0;
 }
