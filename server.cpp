@@ -136,6 +136,7 @@ class User{
         status stat;
         int connect_fd;
         set<string> reqSet;
+        map<string, int> reqType;
         threadSignal acceptReq;
 
         User(){}
@@ -161,9 +162,10 @@ class UserDB{
         void userRegister(string username, string password);
         bool userLogin(string username, string password, int connect_fd);
         void userLogout(string username);
-        int msgRequest(string from, string to);
+        int sendRequest(string from, string to, int type);
         int acceptRequest(string from, string to);
         int requestCount(string username);
+        int requestType(string user1, string user2);
         set<string> getRequest(string username);
         int getHostPort(string username, string& host, string& portnum);
 };
@@ -207,12 +209,14 @@ void UserDB::userLogout(string username){
     pthread_rwlock_unlock(&userRWLock);
 }
 
-int UserDB::msgRequest(string from, string to){
+int UserDB::sendRequest(string from, string to, int type){
     pthread_rwlock_wrlock(&userRWLock);
     reg[to].reqSet.insert(from);
+    reg[to].reqType[from] = type;
     pthread_rwlock_unlock(&userRWLock);
     int retval = reg[from].acceptReq.wait(MAXWAITTIME);
     reg[to].reqSet.erase(from);
+    reg[to].reqType.erase(from);
     return retval;
 }
 
@@ -235,9 +239,20 @@ int UserDB::requestCount(string username){
 }
 set<string> UserDB::getRequest(string username){
     pthread_rwlock_rdlock(&userRWLock);
-    set<string> Set =  reg[username].reqSet;
+    set<string> Set = reg[username].reqSet;
     pthread_rwlock_unlock(&userRWLock);
     return Set;
+}
+
+int UserDB::requestType(string user1, string user2){
+    int ret;
+    pthread_rwlock_rdlock(&userRWLock);
+    if(reg[user1].reqType.count(user2)){
+        ret = reg[user1].reqType[user2];
+    }
+    else ret = -1;
+    pthread_rwlock_unlock(&userRWLock);
+    return ret;
 }
 
 int UserDB::getHostPort(string username, string& host, string& portnum){
@@ -506,12 +521,13 @@ void* worker_thread(void* arg){
             }
             else if(cmd == "connect"){
                 string username;
-                cmdarg >> username;
+                int type;
+                cmdarg >> username >> type;
                 if(!userDatabase.checkOnline(username)){
                     sendFail(connect_fd);
                     continue;
                 }
-                if(userDatabase.msgRequest(currentUser, username) < 0){
+                if(userDatabase.sendRequest(currentUser, username, type) < 0){
                     sendFail(connect_fd);
                     continue;
                 }
@@ -530,7 +546,7 @@ void* worker_thread(void* arg){
                 }
                 sendSuccess(connect_fd);
             }
-            else if(cmd == "msgNum"){
+            else if(cmd == "reqNum"){
                 if(currentUser.empty()){
                     sendString(connect_fd, "0\n");
                 }
@@ -539,7 +555,7 @@ void* worker_thread(void* arg){
                     sendString(connect_fd, to_string(reqNum) + '\n');
                 }
             }
-            else if(cmd == "msgReq"){
+            else if(cmd == "reqSet"){
                 if(currentUser.empty()){
                     sendString(connect_fd, "0\n");
                 }
@@ -547,7 +563,9 @@ void* worker_thread(void* arg){
                     set<string> reqSet = userDatabase.getRequest(currentUser);
                     sendString(connect_fd, to_string(reqSet.size()) + '\n');
                     for(auto it = reqSet.begin(); it != reqSet.end(); ++it){
-                        sendString(connect_fd, *it + '\n');
+                        string username = *it;
+                        int type = userDatabase.requestType(currentUser, username);
+                        sendString(connect_fd, username + ' ' + to_string(type) + '\n');
                     }
                 }
             }

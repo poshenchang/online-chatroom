@@ -9,6 +9,8 @@
 #include <unistd.h>
 #include <err.h>
 #include <iostream>
+#include <fstream>
+#include <sstream>
 #include <vector>
 #include <map>
 #include <set>
@@ -46,6 +48,7 @@ const string help_msg = "------------------------------------\n"
                         "logout             user logout\n"
                         "hello/hi           say hello!\n"
                         "message/msg        chat with other users\n"
+                        "file               send/receive files\n"
                         "exit               exit server session\n"
                         "------------------------------------\n";
 const string working_msg = "Utility under construction.";
@@ -213,9 +216,81 @@ void cleanupClient(){
     EVP_cleanup();
 }
 
-// direct modes messaging
+// P2P connection
 
 pthread_t tid_send, tid_recv;
+
+struct P2P_struct{
+    int fd;
+    SSL* ssl;
+};
+
+int initP2P(string type, string remoteHost, string remotePort, P2P_struct &P2PInfo){
+    int msg_fd;
+    SSL* client_ssl;
+    if(type == "connect"){
+        struct sockaddr_in cliAddr;
+        unsigned short portnum = stoi(remotePort);
+        // Create the socket
+        msg_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if(msg_fd < 0){
+            cerr << "Error creating socket" << endl;
+            return -1;
+        }
+        // Setup the client address structure
+        memset(&cliAddr, 0, sizeof(cliAddr));
+        cliAddr.sin_family = AF_INET;
+        cliAddr.sin_port = htons(portnum);
+        if(inet_pton(AF_INET, remoteHost.c_str(), &cliAddr.sin_addr) <= 0){
+            cerr << remoteHost << endl;
+            cerr << "Invalid Address" << endl;
+            close(msg_fd);
+            return -1;
+        }
+        // Connect to the remote client
+        if(connect(msg_fd, (struct sockaddr*)&cliAddr, sizeof(cliAddr)) < 0){
+            cerr << "Connection Failed" << endl;
+            close(msg_fd);
+            return -1;
+        }
+        // Setup OpenSSL
+        client_ssl = SSL_new(client_ctx);
+        SSL_set_fd(client_ssl, msg_fd);
+        if(SSL_connect(client_ssl) <= 0){
+            ERR_print_errors_fp(stderr);
+        }
+    }
+    else if(type == "accept"){
+        struct sockaddr_in cliAddr;
+        size_t clilen;
+
+        clilen = sizeof(cliAddr);
+        msg_fd = accept(listen_fd, (struct sockaddr*)&cliAddr, (socklen_t*)&clilen);
+        if(msg_fd < 0){
+            if(errno == EINTR || errno == EAGAIN) return -1;  // try again
+            cerr << "Cannot accept client connection" << endl;
+        }
+        // Setup OpenSSL
+        client_ssl = SSL_new(server_ctx);
+        SSL_set_fd(client_ssl, msg_fd);
+        if(SSL_accept(client_ssl) <= 0){
+            ERR_print_errors_fp(stderr);
+        }
+    }
+    else return -1;
+
+    P2PInfo.fd = msg_fd;
+    P2PInfo.ssl = client_ssl;
+    return 0;
+}
+
+void closeP2P(P2P_struct &P2PInfo){
+    SSL_shutdown(P2PInfo.ssl);
+    SSL_free(P2PInfo.ssl);
+    close(P2PInfo.fd);
+}
+
+// Direct mode messaging
 
 struct msg_struct{
     SSL* ssl;
@@ -263,58 +338,13 @@ void* receiveMessage(void* args){
     return nullptr;
 }
 
-static int directMessage(string username, bool init, string remoteHost, string remotePort){
-    int msg_fd;
-    SSL* client_ssl;
-    if(init){
-        struct sockaddr_in cliAddr;
-        unsigned short portnum = stoi(remotePort);
-        // Create the socket
-        msg_fd = socket(AF_INET, SOCK_STREAM, 0);
-        if(msg_fd < 0){
-            cerr << "Error creating socket" << endl;
-            return -1;
-        }
-        // Setup the client address structure
-        memset(&cliAddr, 0, sizeof(cliAddr));
-        cliAddr.sin_family = AF_INET;
-        cliAddr.sin_port = htons(portnum);
-        if(inet_pton(AF_INET, remoteHost.c_str(), &cliAddr.sin_addr) <= 0){
-            cerr << remoteHost << endl;
-            cerr << "Invalid Address" << endl;
-            close(msg_fd);
-            return -1;
-        }
-        // Connect to the remote client
-        if(connect(msg_fd, (struct sockaddr*)&cliAddr, sizeof(cliAddr)) < 0){
-            cerr << "Connection Failed" << endl;
-            close(msg_fd);
-            return -1;
-        }
-        // Setup OpenSSL
-        client_ssl = SSL_new(client_ctx);
-        SSL_set_fd(client_ssl, msg_fd);
-        if(SSL_connect(client_ssl) <= 0){
-            ERR_print_errors_fp(stderr);
-        }
+static int directMessage(string username, string type, string remoteHost, string remotePort){
+    P2P_struct P2PInfo;
+    if(initP2P(type, remoteHost, remotePort, P2PInfo) < 0){
+        cerr << "Failed to initialize P2P connection" << endl;
     }
-    else{
-        struct sockaddr_in cliAddr;
-        size_t clilen;
-
-        clilen = sizeof(cliAddr);
-        msg_fd = accept(listen_fd, (struct sockaddr*)&cliAddr, (socklen_t*)&clilen);
-        if(msg_fd < 0){
-            if(errno == EINTR || errno == EAGAIN) return -1;  // try again
-            cerr << "Cannot accept client connection" << endl;
-        }
-        // Setup OpenSSL
-        client_ssl = SSL_new(server_ctx);
-        SSL_set_fd(client_ssl, msg_fd);
-        if(SSL_accept(client_ssl) <= 0){
-            ERR_print_errors_fp(stderr);
-        }
-    }
+    int msg_fd = P2PInfo.fd;
+    SSL* client_ssl = P2PInfo.ssl;
 
     // clear cin buffer
     string _str; getline(cin, _str);
@@ -331,13 +361,84 @@ static int directMessage(string username, bool init, string remoteHost, string r
     
     // cleanup
     pthread_join(tid_recv, NULL);
-    SSL_shutdown(client_ssl);
-    SSL_free(client_ssl);
-    close(msg_fd);
+    closeP2P(P2PInfo);
     pthread_join(tid_send, NULL);
     delete args;
     cout << "------------------------------------" << endl;
     return 0;
+}
+
+// File transfer
+
+void sendFile(SSL *ssl, string filename, ifstream& file) {
+    // Send the filename to the server first (optional, if needed)
+    size_t filename_len = filename.size();
+    SSL_write(ssl, &filename_len, sizeof(filename_len));  // Send filename length
+    SSL_write(ssl, filename.c_str(), filename_len);       // Send filename
+
+    // Read and send the file in chunks
+    const size_t buffer_size = 1024;  // Buffer size to read the file
+    char buffer[buffer_size];
+    while (file.read(buffer, buffer_size) || file.gcount() > 0) {
+        size_t bytes_read = file.gcount();
+        // Send size of the data to be sent
+        if(SSL_write(ssl, &bytes_read, sizeof(bytes_read)) <= 0) return;
+        // Send the data
+        if(SSL_write(ssl, buffer, bytes_read) <= 0) return;
+    }
+
+    // Indicate end of file transfer
+    size_t end_marker = 0;
+    SSL_write(ssl, &end_marker, sizeof(end_marker));
+
+    cout << "File " << filename << " sent successfully!" << endl;
+}
+
+void receiveFile(SSL *ssl) {
+    // Receive the pathname first
+    size_t pathname_len;
+    SSL_read(ssl, &pathname_len, sizeof(pathname_len));  // Get pathname length
+
+    char *pathname = new char[pathname_len + 1];
+    SSL_read(ssl, pathname, pathname_len);  // Get pathname
+    pathname[pathname_len] = '\0';  // Null-terminate the pathname
+
+    char* filename = pathname;  // Extract filename
+    for(int i=pathname_len-1; i>=0; i--){
+        if(pathname[i] == '/'){
+            filename = pathname + i + 1;
+        }
+    }
+
+    // Open a file to write the received data
+    if (ifstream(filename)){
+        cerr << "File " << filename << " already exists" << endl;
+        return;
+    }
+    ofstream file(filename, ios::binary);
+    if (!file.is_open()) {
+        cerr << "Error opening file for writing " << filename << endl;
+        delete[] filename;
+        return;
+    }
+
+    cout << "Receiving file " << filename << " ..." << endl;
+
+    // Receive the file in chunks
+    size_t bytes_to_read;
+    char buffer[1024];
+    while (true) {
+        SSL_read(ssl, &bytes_to_read, sizeof(bytes_to_read));  // Get the number of bytes to read
+        if (bytes_to_read == 0) break;  // End of file transfer
+
+        SSL_read(ssl, buffer, bytes_to_read);  // Receive the data
+        file.write(buffer, bytes_to_read);     // Write the data to the file
+    }
+
+    cout << "File " << filename << " received successfully!" << endl;
+
+    delete[] pathname;
+    file.close();
 }
 
 // read std::string from server_ssl
@@ -453,11 +554,11 @@ int main(int argc, char** argv){
     while(!exit){
         // check for pending message requests
         if(!currentUser.empty()){
-            sendString("msgNum\n");
+            sendString("reqNum\n");
             string buf = receiveLine();
             int numReq = stoi(buf);
             if(numReq > 0){
-                cout << "[Notification] You have " << numReq << " pending message requests. Type 'message' to enter chatroom.\n";
+                cout << "[Notification] You have " << numReq << " pending requests. Type 'message'/'file'/'audio' to see respective requests.\n";
             }
         }
 
@@ -539,16 +640,21 @@ int main(int argc, char** argv){
                 continue;
             }
             // get pending message requests
-            sendString("msgReq\n");
-            set<string> reqSet;
+            sendString("reqSet\n");
+            set<string> msgSet;
             string buf = receiveLine();
             int numReq = stoi(buf);
-            if(numReq > 0){
+            for(int i=0; i<numReq; i++){
+                buf = receiveLine();
+                stringstream ss; ss << buf;
+                string username; int type;
+                ss >> username >> type;
+                if(type == 0) msgSet.insert(username);
+            }
+            if(msgSet.size() > 0){
                 cout << "Pending message requests from:" << endl;
-                for(int i=0; i<numReq; i++){
-                    buf = receiveLine();
-                    reqSet.insert(buf);
-                    cout << "* " << buf << endl;
+                for(auto username: msgSet){
+                    cout << "* " << username << endl;
                 }
             }
 
@@ -561,14 +667,14 @@ int main(int argc, char** argv){
                 continue;
             }
             // Check if user is in pending requests
-            if(reqSet.count(username)){
+            if(msgSet.count(username)){
                 // accept message
                 sendString("accept " + username + '\n');
                 if(!isSuccess()){
                     cout << "Message request from " << username << " expired." << endl;
                 }
                 string remoteHost, remotePort;
-                directMessage(username, false, remoteHost, remotePort);
+                directMessage(username, "accept", remoteHost, remotePort);
             }
             else{
                 // Check if user exists
@@ -578,7 +684,7 @@ int main(int argc, char** argv){
                     continue;
                 }
                 // Send message request
-                sendString("connect " + username + '\n');
+                sendString("connect " + username + " 0\n");
                 cout << "Connecting to " << username << ", request pending..." << endl;
                 if(!isSuccess()){
                     cout << "Request failed. User offline or request timeout." << endl;
@@ -587,8 +693,103 @@ int main(int argc, char** argv){
                 // get client IP and portnum
                 string remoteHost = receiveLine();
                 string remotePort = receiveLine();
-                directMessage(username, true, remoteHost, remotePort);
+                directMessage(username, "connect", remoteHost, remotePort);
             }            
+        }
+        else if(cmd == "file"){
+            // Check if logged in
+            if(currentUser.empty()){
+                cout << "You are not currently logged in. Please log in first." << endl;
+                continue;
+            }
+            // get pending file transfer requests
+            sendString("reqSet\n");
+            set<string> fileSet;
+            string buf = receiveLine();
+            int numReq = stoi(buf);
+            for(int i=0; i<numReq; i++){
+                buf = receiveLine();
+                stringstream ss; ss << buf;
+                string username; int type;
+                ss >> username >> type;
+                if(type == 1) fileSet.insert(username);
+            }
+            string type;
+            if(fileSet.size() > 0){
+                cout << "Pending file transfer requests from:" << endl;
+                for(auto username: fileSet){
+                    cout << "* " << username << endl;
+                }
+                cout << "Would you like to send a file or receive a file?\n"
+                        "Enter 'S' to send or 'R' to receive: ";
+                cin >> type;
+            }
+            else type = "S";
+
+            if(type == "S"){
+                string username;
+                cout << "Who do you want to send files to? Enter username: ";
+                cin >> username;
+                // User cannot send file to themselves
+                if(username == currentUser){
+                    cout << "Choose a user other than yourself to send files to." << endl;
+                    continue;
+                }
+                // Check if user exists
+                sendString("checkuser " + username + '\n');
+                if(!isSuccess()){
+                    cout << "User does not exist." << endl;
+                    continue;
+                }
+                // Select file
+                string filename;
+                cout << "Select a file to transfer (enter pathname): ";
+                cin >> filename;
+                ifstream file(filename, ios::binary);
+                if (!file.is_open()) {
+                    cerr << "Error opening file " << filename << endl;
+                    continue;
+                }
+                // Send file transfer request
+                sendString("connect " + username + " 1\n");
+                cout << "File transfer request to " << username << " pending..." << endl;
+                if(!isSuccess()){
+                    cout << "Request failed. User offline or request timeout." << endl;
+                    continue;
+                }
+                // get client IP and portnum
+                string remoteHost = receiveLine();
+                string remotePort = receiveLine();
+                P2P_struct P2PInfo;
+                initP2P("connect", remoteHost, remotePort, P2PInfo);
+                sendFile(P2PInfo.ssl, filename, file);
+                file.close();
+            }
+            else if(type == "R"){
+                string username;
+                // Check if user is in pending requests
+                while(true){
+                    cout << "Who do you want to receive files from? Enter username: ";
+                    cin >> username;
+                    if(!fileSet.count(username)){
+                        cout << "No pending file transfer requests from " << username << endl;
+                    }
+                    else break;
+                }
+                // accept file
+                sendString("accept " + username + '\n');
+                if(!isSuccess()){
+                    cout << "File transfer request from " << username << " expired." << endl;
+                }
+                // get client IP and portnum
+                P2P_struct P2PInfo;
+                initP2P("accept", "", "", P2PInfo);
+                receiveFile(P2PInfo.ssl);
+            }
+            else{
+                cout << "Invalid argument. " << endl;
+                continue;
+            }      
         }
         else if(cmd == "hello" || cmd == "hi"){
             if(!currentUser.empty()){
