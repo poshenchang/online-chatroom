@@ -9,6 +9,7 @@ The server acts as a central hub that relays and process messages in between cli
 * User authentication(registration, login, logout)
 * Multithread server: supports up to 20 concurrent connections
 * Peer-to-peer messaging: messages are sent directly from client to client without passing through server
+* OpenSSL encryption: secure communication system for both client-to-client and client-to-server interactions.
 
 ## Prerequisites
 
@@ -26,12 +27,17 @@ cd online-chatroom
 make
 ```
 
-3. Run server with a specified port
+3. Generate a private key and a self-signed certificate for the server/client:
+```bash
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes
+```
+
+4. Run server with a specified port
 ```bash
 ./server <port>
 ```
 
-4. Start a client with the server's IP address and port
+5. Start a client with the server's IP address and port
 ```bash
 ./client <server-ip> <server-port>
 ```
@@ -48,4 +54,4 @@ make
 
 ## Limitations and future improvements
 
-Currently, messages are transmitted in plain text. File transfer or multimedia are not (yet) supported. Future improvements could include message encryption, enhanced authentication, and a GUI for a more user-friendly experience.
+Currently, messages are transmitted in plain text. File transfer or multimedia are not (yet) supported. Future improvements could include audio/video streaming and a GUI for a more user-friendly experience.
