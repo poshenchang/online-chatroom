@@ -4,7 +4,10 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <err.h>
+#include <portaudio.h>
+#include <mpg123.h>
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -19,16 +22,10 @@
 #include <climits>
 #include <atomic>
 
-extern "C" {
-    #include <libavformat/avformat.h>
-    #include <libavcodec/avcodec.h>
-    #include <libswresample/swresample.h>
-    #include <SDL2/SDL.h>
-}
-
 using namespace std;
 
 #define BUFFERSIZE 1024
+#define BUFFERSIZE_AUDIO 4096
 
 // Function prototypes
 
@@ -481,114 +478,174 @@ void receiveFile(SSL *ssl) {
 
 // Audio streaming
 
-void sendAudioFrames(SSL* ssl, const string& filePath) {
-    AVFormatContext* formatCtx = nullptr;
-
-    // Open audio file
-    if (avformat_open_input(&formatCtx, filePath.c_str(), nullptr, nullptr) < 0) {
-        cerr << "Failed to open audio file" << endl;
+void sendAudio(SSL* ssl, const std::string& filePath) {
+    std::ifstream audioFile(filePath, std::ios::binary);
+    if (!audioFile.is_open()) {
+        std::cerr << "Error: Unable to open audio file." << std::endl;
         return;
     }
 
-    // Find stream info
-    if (avformat_find_stream_info(formatCtx, nullptr) < 0) {
-        cerr << "Failed to find stream info." << endl;
-        avformat_close_input(&formatCtx);
-        return;
-    }
+    audioFile.seekg(0, ios::end);
+    size_t fileSize = audioFile.tellg();
+    audioFile.seekg(0, ios::beg);
+    SSL_write(ssl, &fileSize, sizeof(fileSize));
 
-    // Find the best audio stream
-    int audioStreamIndex = av_find_best_stream(formatCtx, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
-    if (audioStreamIndex < 0) {
-        cerr << "No audio stream found" << endl;
-        avformat_close_input(&formatCtx);
-        return;
-    }
-
-    AVCodecParameters* codecParams = formatCtx->streams[audioStreamIndex]->codecpar;
-    const AVCodec* codec = avcodec_find_decoder(codecParams->codec_id);
-    if (!codec) {
-        cerr << "Decoder not found" << endl;
-        avformat_close_input(&formatCtx);
-        return;
-    }
-
-    AVCodecContext* codecCtx = avcodec_alloc_context3(codec);
-    avcodec_parameters_to_context(codecCtx, codecParams);
-    codecCtx->pkt_timebase = formatCtx->streams[audioStreamIndex]->time_base;
-    if (avcodec_open2(codecCtx, codec, nullptr) < 0) {
-        cerr << "Failed to open codec" << endl;
-        avcodec_free_context(&codecCtx);
-        avformat_close_input(&formatCtx);
-        return;
-    }
-
-    AVPacket* packet = av_packet_alloc();
-    AVFrame* frame = av_frame_alloc();
-
-    // Read and send audio frames
-    while (av_read_frame(formatCtx, packet) >= 0) {
-        if (packet->stream_index == audioStreamIndex) {
-            if (avcodec_send_packet(codecCtx, packet) == 0) {
-                while (avcodec_receive_frame(codecCtx, frame) == 0) {
-                    int dataSize = av_samples_get_buffer_size(
-                        nullptr, codecCtx->ch_layout.nb_channels, frame->nb_samples,
-                        codecCtx->sample_fmt, 1);
-
-                    if (dataSize > 0) {
-                        int bytesSent = SSL_write(ssl, frame->data[0], dataSize);
-                        if (bytesSent <= 0) {
-                            cerr << "SSL_write failed: " << bytesSent << endl;
-                            break;
-                        }
-                    }
-                }
-            }
+    char buffer[BUFFERSIZE_AUDIO];
+    while (audioFile.read(buffer, sizeof(buffer))) {
+        if (SSL_write(ssl, buffer, sizeof(buffer)) <= 0) {
+            std::cerr << "Error: SSL_write failed." << std::endl;
+            break;
         }
-        av_packet_unref(packet);
+    }
+    // Send any remaining data
+    if (audioFile.gcount() > 0) {
+        SSL_write(ssl, buffer, audioFile.gcount());
     }
 
-    // Cleanup
-    av_frame_free(&frame);
-    av_packet_free(&packet);
-    avcodec_free_context(&codecCtx);
-    avformat_close_input(&formatCtx);
-
-    cout << "Audio " << filePath << " successfully streamed." << endl;
+    audioFile.close();
+    std::cout << "Audio stream sent successfully." << std::endl;
 }
 
-void receiveAndPlayAudio(SSL* ssl, int sampleRate, int channels) {
-    if (SDL_Init(SDL_INIT_AUDIO) < 0) {
-        cerr << "Failed to initialize SDL: " << SDL_GetError() << endl;
+struct AudioData{
+    char* buffer;
+    size_t bufferSize;
+    size_t currentPosition;
+};
+
+int playAudioCallback(const void* inputBuffer, void* outputBuffer, unsigned long framesPerBuffer, 
+                  const PaStreamCallbackTimeInfo* timeInfo, PaStreamCallbackFlags statusFlags, void* userData){
+    AudioData* audioData = (AudioData*)userData;
+    char* out = (char*)outputBuffer;
+    unsigned long bytesToCopy = framesPerBuffer*2;
+
+    if(audioData->currentPosition + bytesToCopy > audioData->bufferSize){
+        bytesToCopy = audioData->bufferSize - audioData->currentPosition;
+    }
+
+    memcpy(out, audioData->buffer + audioData->currentPosition, bytesToCopy);
+    audioData->currentPosition += bytesToCopy;
+
+    if(bytesToCopy < framesPerBuffer*2){
+        memset(out + bytesToCopy, 0, (framesPerBuffer*2) - bytesToCopy);
+    }
+
+    return (audioData->currentPosition >= audioData->bufferSize) ? paComplete : paContinue;
+}
+
+bool decodeMP3(const char* mp3Data, size_t mp3Size, char*& pcmBuffer, size_t& pcmSize){
+    mpg123_init();
+    mpg123_handle* mh = mpg123_new(nullptr, nullptr);
+    if(!mh){
+        cerr << "Unable to initialize mpg123." << endl;
+        return false;
+    }
+
+    if(mpg123_open_feed(mh) != MPG123_OK){
+        cerr << "Failed to open feed." << endl;
+        mpg123_delete(mh);
+        mpg123_exit();
+        return false;
+    }
+
+    mpg123_format_none(mh);
+    mpg123_format(mh, 44100, MPG123_MONO, MPG123_ENC_SIGNED_16);
+
+    size_t bufferSize = 0;
+    size_t done = 0;
+    unsigned char* tempBuffer = nullptr;
+    size_t totalDecoded = 0;
+
+    size_t bytesLeft = mp3Size;
+    size_t offset = 0;
+
+    while(bytesLeft > 0){
+        size_t bytesToFeed = min(bytesLeft, static_cast<size_t>(1024));
+        int feedResult = mpg123_feed(mh, reinterpret_cast<const unsigned char*>(mp3Data + offset), bytesToFeed);
+        if(feedResult != MPG123_OK){
+            cerr << "Feeding MP3 data failed: " << mpg123_strerror(mh) << endl;
+            mpg123_delete(mh);
+            mpg123_exit();
+            return false;
+        }
+
+        while(mpg123_decode_frame(mh, nullptr, &tempBuffer, &done) == MPG123_OK){
+            pcmBuffer = (char*)realloc(pcmBuffer, bufferSize + done);
+            memcpy(pcmBuffer + bufferSize, tempBuffer, done);
+            bufferSize += done;
+            totalDecoded += done;
+        }
+        
+        bytesLeft -= bytesToFeed;
+        offset += bytesToFeed;
+    }
+
+    pcmSize = bufferSize;
+    
+    mpg123_delete(mh);
+    mpg123_exit();
+
+    return true;
+}
+
+void receiveAndPlayAudio(SSL* ssl){
+    size_t fileSize;
+    if(SSL_read(ssl, &fileSize, sizeof(fileSize)) <= 0){
+        cerr << "Failed to read from SSL connection." << endl;
         return;
     }
 
-    SDL_AudioSpec spec;
-    spec.freq = sampleRate;
-    spec.format = AUDIO_S16SYS;
-    spec.channels = channels;
-    spec.samples = 4096;
-    spec.callback = nullptr;
+    char* mp3Buffer = nullptr;
+    mp3Buffer = new char[fileSize];
 
-    if (SDL_OpenAudio(&spec, nullptr) < 0) {
-        cerr << "Failed to open audio: " << SDL_GetError() << endl;
-        SDL_Quit();
+    size_t totalReceived = 0;
+    while(totalReceived < fileSize){
+        int bytes = SSL_read(ssl, mp3Buffer + totalReceived, 1024);
+        if(bytes <= 0){
+            cerr << "Failed to read from SSL connection." << endl;
+            delete[] mp3Buffer;
+            return;
+        }
+        totalReceived += bytes;
+    }
+
+    char* pcmBuffer = nullptr;
+    size_t pcmSize = 0;
+    if(!decodeMP3(mp3Buffer, fileSize, pcmBuffer, pcmSize)){
+        cerr << "Failed to decode MP3 file." << endl;
+        delete[] mp3Buffer;
         return;
     }
 
-    SDL_PauseAudio(0);
+    delete[] mp3Buffer;
 
-    uint8_t buffer[4096];
-    int bytesRead;
+    cout << "Playing audio..." << endl;
 
-    // Receive and play audio frames
-    while ((bytesRead = SSL_read(ssl, buffer, sizeof(buffer))) > 0) {
-        SDL_QueueAudio(1, buffer, bytesRead);
+    // mute portaudio logs
+    int saved_stderr = dup(STDERR_FILENO);
+    int devnull = open("/dev/null", O_RDWR);
+    dup2(devnull, STDERR_FILENO);  // Replace standard out
+    Pa_Initialize();
+    dup2(saved_stderr, STDERR_FILENO);
+
+    AudioData audioData = {pcmBuffer, pcmSize, 0};
+    PaStream* stream;
+    if(Pa_OpenDefaultStream(&stream, 0, 1, paInt16, 44100, 512, playAudioCallback, &audioData) != paNoError){
+        cerr << "Failed to open audio stream." << endl;
+        delete[] pcmBuffer;
+        Pa_Terminate();
+        return;
     }
 
-    SDL_CloseAudio();
-    SDL_Quit();
-    cout << "Finished streaming audio." << endl;
+    Pa_StartStream(stream);
+
+    while(Pa_IsStreamActive(stream)){
+        Pa_Sleep(100);
+    }
+    
+    Pa_StartStream(stream);
+    Pa_CloseStream(stream);
+    Pa_Terminate();
+    cout << "Audio playback completed." << endl;
 }
 
 // read std::string from server_ssl
@@ -1008,7 +1065,7 @@ int main(int argc, char** argv){
                 P2Pconnect(remoteHost, remotePort, P2PInfo);
 
                 // Send audio frames
-                sendAudioFrames(P2PInfo.ssl, filename);
+                sendAudio(P2PInfo.ssl, filename);
                 closeP2P(P2PInfo);
             }
             else if(type == "R"){
@@ -1030,7 +1087,7 @@ int main(int argc, char** argv){
                 // get client IP and portnum
                 P2P_struct P2PInfo;
                 P2Paccept(P2PInfo);
-                receiveAndPlayAudio(P2PInfo.ssl, 44100, 2);
+                receiveAndPlayAudio(P2PInfo.ssl);
                 closeP2P(P2PInfo);
             }
             else{

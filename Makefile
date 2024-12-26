@@ -1,6 +1,6 @@
 CC = g++
 CFLAGS = -Wall -g
-LDFLAGS = -lssl -lcrypto -lavformat -lavcodec -lavutil -lswresample -lswscale -lSDL2
+LDFLAGS = -lssl -lcrypto -lportaudio -lmpg123
 
 all: server client
 
