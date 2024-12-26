@@ -1,6 +1,3 @@
-// TODO: File tranfer
-// TODO: Audio streaming
-
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -156,6 +153,7 @@ class UserDB{
     public:
         UserDB(){
             pthread_rwlock_t userRWLock = PTHREAD_RWLOCK_INITIALIZER;
+            (void)userRWLock;
         };
         bool checkUser(string username);
         bool checkOnline(string username);

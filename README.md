@@ -14,6 +14,8 @@ The server acts as a central hub that relays and process messages in between cli
 ## Prerequisites
 
 * g++ (GCC) 14.2.1 or similar compiler
+* boost 1.86.0-4
+* ffmpeg 2:7-1-5
 * Linux/UNIX system is recommended
 
 ## Installation and Usage

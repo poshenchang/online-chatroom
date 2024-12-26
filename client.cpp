@@ -1,6 +1,3 @@
-// TODO: File tranfer
-// TODO: Audio streaming
-
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -21,6 +18,14 @@
 #include <ctime>
 #include <climits>
 #include <atomic>
+
+extern "C" {
+    #include <libavformat/avformat.h>
+    #include <libavcodec/avcodec.h>
+    #include <libswresample/swresample.h>
+    #include <SDL2/SDL.h>
+}
+
 using namespace std;
 
 #define BUFFERSIZE 1024
@@ -49,6 +54,8 @@ const string help_msg = "------------------------------------\n"
                         "hello/hi           say hello!\n"
                         "message/msg        chat with other users\n"
                         "file               send/receive files\n"
+                        "audio              send/receive audio streaming\n"
+                        "refresh/r          reload msg/file/audio requests\n"
                         "exit               exit server session\n"
                         "------------------------------------\n";
 const string working_msg = "Utility under construction.";
@@ -168,7 +175,6 @@ static int connectServer(const char* serverIP, const unsigned short portnum){
         ERR_print_errors_fp(stderr);
         exit(-1);
     }
-    // SSL_write(server_ssl, "test message\n", 13);
 
     cout << "Connected to server at " << serverIP << ":" << portnum << endl;
 
@@ -225,59 +231,69 @@ struct P2P_struct{
     SSL* ssl;
 };
 
-int initP2P(string type, string remoteHost, string remotePort, P2P_struct &P2PInfo){
+int P2Pconnect(string remoteHost, string remotePort, P2P_struct &P2PInfo){
     int msg_fd;
     SSL* client_ssl;
-    if(type == "connect"){
-        struct sockaddr_in cliAddr;
-        unsigned short portnum = stoi(remotePort);
-        // Create the socket
-        msg_fd = socket(AF_INET, SOCK_STREAM, 0);
-        if(msg_fd < 0){
-            cerr << "Error creating socket" << endl;
-            return -1;
-        }
-        // Setup the client address structure
-        memset(&cliAddr, 0, sizeof(cliAddr));
-        cliAddr.sin_family = AF_INET;
-        cliAddr.sin_port = htons(portnum);
-        if(inet_pton(AF_INET, remoteHost.c_str(), &cliAddr.sin_addr) <= 0){
-            cerr << remoteHost << endl;
-            cerr << "Invalid Address" << endl;
-            close(msg_fd);
-            return -1;
-        }
-        // Connect to the remote client
-        if(connect(msg_fd, (struct sockaddr*)&cliAddr, sizeof(cliAddr)) < 0){
-            cerr << "Connection Failed" << endl;
-            close(msg_fd);
-            return -1;
-        }
-        // Setup OpenSSL
-        client_ssl = SSL_new(client_ctx);
-        SSL_set_fd(client_ssl, msg_fd);
-        if(SSL_connect(client_ssl) <= 0){
-            ERR_print_errors_fp(stderr);
-        }
-    }
-    else if(type == "accept"){
-        struct sockaddr_in cliAddr;
-        size_t clilen;
 
-        clilen = sizeof(cliAddr);
-        msg_fd = accept(listen_fd, (struct sockaddr*)&cliAddr, (socklen_t*)&clilen);
-        if(msg_fd < 0){
-            if(errno == EINTR || errno == EAGAIN) return -1;  // try again
-            cerr << "Cannot accept client connection" << endl;
-        }
-        // Setup OpenSSL
-        client_ssl = SSL_new(server_ctx);
-        SSL_set_fd(client_ssl, msg_fd);
-        if(SSL_accept(client_ssl) <= 0){
-            ERR_print_errors_fp(stderr);
-        }
+    struct sockaddr_in cliAddr;
+    unsigned short portnum = stoi(remotePort);
+    // Create the socket
+    msg_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if(msg_fd < 0){
+        cerr << "Error creating socket" << endl;
+        return -1;
     }
-    else return -1;
+    // Setup the client address structure
+    memset(&cliAddr, 0, sizeof(cliAddr));
+    cliAddr.sin_family = AF_INET;
+    cliAddr.sin_port = htons(portnum);
+    if(inet_pton(AF_INET, remoteHost.c_str(), &cliAddr.sin_addr) <= 0){
+        cerr << remoteHost << endl;
+        cerr << "Invalid Address" << endl;
+        close(msg_fd);
+        return -1;
+    }
+    // Connect to the remote client
+    if(connect(msg_fd, (struct sockaddr*)&cliAddr, sizeof(cliAddr)) < 0){
+        cerr << "Connection Failed" << endl;
+        close(msg_fd);
+        return -1;
+    }
+    // Setup OpenSSL
+    client_ssl = SSL_new(client_ctx);
+    SSL_set_fd(client_ssl, msg_fd);
+    if(SSL_connect(client_ssl) <= 0){
+        ERR_print_errors_fp(stderr);
+    }
+
+    P2PInfo.fd = msg_fd;
+    P2PInfo.ssl = client_ssl;
+    return 0;
+}
+
+int P2Paccept(P2P_struct &P2PInfo){
+    int msg_fd;
+    SSL* client_ssl;
+
+    struct sockaddr_in cliAddr;
+    size_t clilen;
+
+    clilen = sizeof(cliAddr);
+    msg_fd = accept(listen_fd, (struct sockaddr*)&cliAddr, (socklen_t*)&clilen);
+    if(msg_fd < 0){
+        if(errno == EINTR || errno == EAGAIN) return -1;  // try again
+        cerr << "Cannot accept client connection" << endl;
+    }
+    // Setup OpenSSL
+    client_ssl = SSL_new(server_ctx);
+    if (!client_ssl) {
+        fprintf(stderr, "Failed to create SSL object.\n");
+        return -1;
+    }
+    SSL_set_fd(client_ssl, msg_fd);
+    if(SSL_accept(client_ssl) <= 0){
+        ERR_print_errors_fp(stderr);
+    }
 
     P2PInfo.fd = msg_fd;
     P2PInfo.ssl = client_ssl;
@@ -285,9 +301,22 @@ int initP2P(string type, string remoteHost, string remotePort, P2P_struct &P2PIn
 }
 
 void closeP2P(P2P_struct &P2PInfo){
-    SSL_shutdown(P2PInfo.ssl);
-    SSL_free(P2PInfo.ssl);
-    close(P2PInfo.fd);
+    if (P2PInfo.ssl) {
+        int shutdownResult = SSL_shutdown(P2PInfo.ssl);
+        // If the shutdown result is 0, we need to call SSL_shutdown again
+        if (shutdownResult == 0) {
+            SSL_shutdown(P2PInfo.ssl);
+        }
+
+        // Free the SSL structure
+        SSL_free(P2PInfo.ssl);
+        P2PInfo.ssl = nullptr;
+    }
+
+    if (P2PInfo.fd) {
+        close(P2PInfo.fd);
+        P2PInfo.fd = -1;
+    }
 }
 
 // Direct mode messaging
@@ -340,10 +369,19 @@ void* receiveMessage(void* args){
 
 static int directMessage(string username, string type, string remoteHost, string remotePort){
     P2P_struct P2PInfo;
-    if(initP2P(type, remoteHost, remotePort, P2PInfo) < 0){
-        cerr << "Failed to initialize P2P connection" << endl;
+    if(type == "connect"){
+        if(P2Pconnect(remoteHost, remotePort, P2PInfo) < 0){
+            cerr << "Failed to initialize P2P connection" << endl;
+            return -1;
+        }
     }
-    int msg_fd = P2PInfo.fd;
+    else if(type == "accept"){
+        if(P2Paccept(P2PInfo) < 0){
+            cerr << "Failed to initialize P2P connection" << endl;
+            return -1;
+        }
+    }
+    else return -1;
     SSL* client_ssl = P2PInfo.ssl;
 
     // clear cin buffer
@@ -439,6 +477,118 @@ void receiveFile(SSL *ssl) {
 
     delete[] pathname;
     file.close();
+}
+
+// Audio streaming
+
+void sendAudioFrames(SSL* ssl, const string& filePath) {
+    AVFormatContext* formatCtx = nullptr;
+
+    // Open audio file
+    if (avformat_open_input(&formatCtx, filePath.c_str(), nullptr, nullptr) < 0) {
+        cerr << "Failed to open audio file" << endl;
+        return;
+    }
+
+    // Find stream info
+    if (avformat_find_stream_info(formatCtx, nullptr) < 0) {
+        cerr << "Failed to find stream info." << endl;
+        avformat_close_input(&formatCtx);
+        return;
+    }
+
+    // Find the best audio stream
+    int audioStreamIndex = av_find_best_stream(formatCtx, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+    if (audioStreamIndex < 0) {
+        cerr << "No audio stream found" << endl;
+        avformat_close_input(&formatCtx);
+        return;
+    }
+
+    AVCodecParameters* codecParams = formatCtx->streams[audioStreamIndex]->codecpar;
+    const AVCodec* codec = avcodec_find_decoder(codecParams->codec_id);
+    if (!codec) {
+        cerr << "Decoder not found" << endl;
+        avformat_close_input(&formatCtx);
+        return;
+    }
+
+    AVCodecContext* codecCtx = avcodec_alloc_context3(codec);
+    avcodec_parameters_to_context(codecCtx, codecParams);
+    codecCtx->pkt_timebase = formatCtx->streams[audioStreamIndex]->time_base;
+    if (avcodec_open2(codecCtx, codec, nullptr) < 0) {
+        cerr << "Failed to open codec" << endl;
+        avcodec_free_context(&codecCtx);
+        avformat_close_input(&formatCtx);
+        return;
+    }
+
+    AVPacket* packet = av_packet_alloc();
+    AVFrame* frame = av_frame_alloc();
+
+    // Read and send audio frames
+    while (av_read_frame(formatCtx, packet) >= 0) {
+        if (packet->stream_index == audioStreamIndex) {
+            if (avcodec_send_packet(codecCtx, packet) == 0) {
+                while (avcodec_receive_frame(codecCtx, frame) == 0) {
+                    int dataSize = av_samples_get_buffer_size(
+                        nullptr, codecCtx->ch_layout.nb_channels, frame->nb_samples,
+                        codecCtx->sample_fmt, 1);
+
+                    if (dataSize > 0) {
+                        int bytesSent = SSL_write(ssl, frame->data[0], dataSize);
+                        if (bytesSent <= 0) {
+                            cerr << "SSL_write failed: " << bytesSent << endl;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        av_packet_unref(packet);
+    }
+
+    // Cleanup
+    av_frame_free(&frame);
+    av_packet_free(&packet);
+    avcodec_free_context(&codecCtx);
+    avformat_close_input(&formatCtx);
+
+    cout << "Audio " << filePath << " successfully streamed." << endl;
+}
+
+void receiveAndPlayAudio(SSL* ssl, int sampleRate, int channels) {
+    if (SDL_Init(SDL_INIT_AUDIO) < 0) {
+        cerr << "Failed to initialize SDL: " << SDL_GetError() << endl;
+        return;
+    }
+
+    SDL_AudioSpec spec;
+    spec.freq = sampleRate;
+    spec.format = AUDIO_S16SYS;
+    spec.channels = channels;
+    spec.samples = 4096;
+    spec.callback = nullptr;
+
+    if (SDL_OpenAudio(&spec, nullptr) < 0) {
+        cerr << "Failed to open audio: " << SDL_GetError() << endl;
+        SDL_Quit();
+        return;
+    }
+
+    SDL_PauseAudio(0);
+
+    uint8_t buffer[4096];
+    int bytesRead;
+
+    // Receive and play audio frames
+    while ((bytesRead = SSL_read(ssl, buffer, sizeof(buffer))) > 0) {
+        SDL_QueueAudio(1, buffer, bytesRead);
+    }
+
+    SDL_CloseAudio();
+    SDL_Quit();
+    cout << "Finished streaming audio." << endl;
 }
 
 // read std::string from server_ssl
@@ -761,9 +911,10 @@ int main(int argc, char** argv){
                 string remoteHost = receiveLine();
                 string remotePort = receiveLine();
                 P2P_struct P2PInfo;
-                initP2P("connect", remoteHost, remotePort, P2PInfo);
+                P2Pconnect(remoteHost, remotePort, P2PInfo);
                 sendFile(P2PInfo.ssl, filename, file);
                 file.close();
+                closeP2P(P2PInfo);
             }
             else if(type == "R"){
                 string username;
@@ -783,8 +934,104 @@ int main(int argc, char** argv){
                 }
                 // get client IP and portnum
                 P2P_struct P2PInfo;
-                initP2P("accept", "", "", P2PInfo);
+                P2Paccept(P2PInfo);
                 receiveFile(P2PInfo.ssl);
+                closeP2P(P2PInfo);
+            }
+            else{
+                cout << "Invalid argument. " << endl;
+                continue;
+            }      
+        }
+        else if(cmd == "audio"){
+            // Check if logged in
+            if(currentUser.empty()){
+                cout << "You are not currently logged in. Please log in first." << endl;
+                continue;
+            }
+            // get pending file transfer requests
+            sendString("reqSet\n");
+            set<string> fileSet;
+            string buf = receiveLine();
+            int numReq = stoi(buf);
+            for(int i=0; i<numReq; i++){
+                buf = receiveLine();
+                stringstream ss; ss << buf;
+                string username; int type;
+                ss >> username >> type;
+                if(type == 2) fileSet.insert(username);
+            }
+            string type;
+            if(fileSet.size() > 0){
+                cout << "Pending audio streaming requests from:" << endl;
+                for(auto username: fileSet){
+                    cout << "* " << username << endl;
+                }
+                cout << "Would you like to send or receive an audio stream?\n"
+                        "Enter 'S' to send or 'R' to receive: ";
+                cin >> type;
+            }
+            else type = "S";
+
+            if(type == "S"){
+                string username;
+                cout << "Who do you want to send audio to? Enter username: ";
+                cin >> username;
+                // User cannot send file to themselves
+                if(username == currentUser){
+                    cout << "Choose a user other than yourself to send audios to." << endl;
+                    continue;
+                }
+                // Check if user exists
+                sendString("checkuser " + username + '\n');
+                if(!isSuccess()){
+                    cout << "User does not exist." << endl;
+                    continue;
+                }
+                // Select file
+                string filename;
+                cout << "Select a audio to stream (enter pathname): ";
+                cin >> filename;
+
+                // Send file transfer request
+                sendString("connect " + username + " 2\n");
+                cout << "Audio streaming request to " << username << " pending..." << endl;
+                if(!isSuccess()){
+                    cout << "Request failed. User offline or request timeout." << endl;
+                    continue;
+                }
+
+                // get client IP and portnum
+                string remoteHost = receiveLine();
+                string remotePort = receiveLine();
+                P2P_struct P2PInfo;
+                P2Pconnect(remoteHost, remotePort, P2PInfo);
+
+                // Send audio frames
+                sendAudioFrames(P2PInfo.ssl, filename);
+                closeP2P(P2PInfo);
+            }
+            else if(type == "R"){
+                string username;
+                // Check if user is in pending requests
+                while(true){
+                    cout << "Who do you want to receive audio from? Enter username: ";
+                    cin >> username;
+                    if(!fileSet.count(username)){
+                        cout << "No pending audio streaming requests from " << username << endl;
+                    }
+                    else break;
+                }
+                // accept file
+                sendString("accept " + username + '\n');
+                if(!isSuccess()){
+                    cout << "Audio streaming request from " << username << " expired." << endl;
+                }
+                // get client IP and portnum
+                P2P_struct P2PInfo;
+                P2Paccept(P2PInfo);
+                receiveAndPlayAudio(P2PInfo.ssl, 44100, 2);
+                closeP2P(P2PInfo);
             }
             else{
                 cout << "Invalid argument. " << endl;
@@ -798,6 +1045,9 @@ int main(int argc, char** argv){
             else{
                 cout << "Hello, guest! Welcome to the chatroom!" << endl;
             }
+        }
+        else if(cmd == "refresh" || cmd == "r"){
+            continue;
         }
         else if(cmd == "exit"){
             sendString("exit\n");
