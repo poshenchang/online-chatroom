@@ -6,10 +6,12 @@ The server acts as a central hub that relays and process messages in between cli
 
 ## Features
 
-* User authentication(registration, login, logout)
-* Multithread server: supports up to 20 concurrent connections
-* Peer-to-peer messaging: messages are sent directly from client to client without passing through server
+* User authentication(registration, login, logout).
+* Multithread server: supports up to 20 concurrent connections.
+* Peer-to-peer messaging: messages are sent directly from client to client without passing through server.
 * OpenSSL encryption: secure communication system for both client-to-client and client-to-server interactions.
+* File transfer: file transfer feature through SSL connection.
+* Audio streaming: frame-based streaming feature for audio or files through SSL connection.
 
 ## Prerequisites
 
@@ -33,6 +35,7 @@ make
 ```bash
 openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes
 ```
+If you want to use existing private key and self-signed certificate, save them in the same directory as the binaries `server`/`client`.
 
 4. Run server with a specified port
 ```bash
@@ -52,8 +55,10 @@ openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -node
 * `logout`: Log out from account.
 * `hello`/`hi`:  Say hi to the server!
 * `message`/`msg`: Message other users.
+* `file`: File transfer.
+* `audio`: Audio streaming.
 * `exit`: Exit session.
 
 ## Limitations and future improvements
 
-Currently, messages are transmitted in plain text. File transfer or multimedia are not (yet) supported. Future improvements could include audio/video streaming and a GUI for a more user-friendly experience.
+Currently, messages are transmitted in plain text. Future improvements could include video streaming and GUI for a more user-friendly experience.
