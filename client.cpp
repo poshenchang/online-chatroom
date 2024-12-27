@@ -26,6 +26,7 @@ using namespace std;
 
 #define BUFFERSIZE 1024
 #define BUFFERSIZE_AUDIO 4096
+#define SAMPLE_FREQUENCY 44100
 
 // Function prototypes
 
@@ -478,10 +479,10 @@ void receiveFile(SSL *ssl) {
 
 // Audio streaming
 
-void sendAudio(SSL* ssl, const std::string& filePath) {
-    std::ifstream audioFile(filePath, std::ios::binary);
+void sendAudio(SSL* ssl, const string& filePath) {
+    ifstream audioFile(filePath, ios::binary);
     if (!audioFile.is_open()) {
-        std::cerr << "Error: Unable to open audio file." << std::endl;
+        cerr << "Error: Unable to open audio file." << endl;
         return;
     }
 
@@ -493,7 +494,7 @@ void sendAudio(SSL* ssl, const std::string& filePath) {
     char buffer[BUFFERSIZE_AUDIO];
     while (audioFile.read(buffer, sizeof(buffer))) {
         if (SSL_write(ssl, buffer, sizeof(buffer)) <= 0) {
-            std::cerr << "Error: SSL_write failed." << std::endl;
+            cerr << "Error: SSL_write failed." << endl;
             break;
         }
     }
@@ -503,55 +504,55 @@ void sendAudio(SSL* ssl, const std::string& filePath) {
     }
 
     audioFile.close();
-    std::cout << "Audio stream sent successfully." << std::endl;
+    cout << "Audio stream sent successfully." << endl;
 }
 
 struct AudioData{
     char* buffer;
-    size_t bufferSize;
-    size_t currentPosition;
+    size_t bufSize;
+    size_t curPos;
 };
 
 int playAudioCallback(const void* inputBuffer, void* outputBuffer, unsigned long framesPerBuffer, 
                   const PaStreamCallbackTimeInfo* timeInfo, PaStreamCallbackFlags statusFlags, void* userData){
     AudioData* audioData = (AudioData*)userData;
-    char* out = (char*)outputBuffer;
+    char* outbuf = (char*)outputBuffer;
     unsigned long bytesToCopy = framesPerBuffer*2;
 
-    if(audioData->currentPosition + bytesToCopy > audioData->bufferSize){
-        bytesToCopy = audioData->bufferSize - audioData->currentPosition;
+    if(audioData->curPos + bytesToCopy > audioData->bufSize){
+        bytesToCopy = audioData->bufSize - audioData->curPos;
     }
 
-    memcpy(out, audioData->buffer + audioData->currentPosition, bytesToCopy);
-    audioData->currentPosition += bytesToCopy;
+    memcpy(outbuf, audioData->buffer + audioData->curPos, bytesToCopy);
+    audioData->curPos += bytesToCopy;
+    if(bytesToCopy < framesPerBuffer*2) memset(outbuf + bytesToCopy, 0, (framesPerBuffer*2) - bytesToCopy);
 
-    if(bytesToCopy < framesPerBuffer*2){
-        memset(out + bytesToCopy, 0, (framesPerBuffer*2) - bytesToCopy);
+    if(audioData->curPos >= audioData->bufSize){
+        return paComplete;
     }
-
-    return (audioData->currentPosition >= audioData->bufferSize) ? paComplete : paContinue;
+    else return paContinue;
 }
 
 bool decodeMP3(const char* mp3Data, size_t mp3Size, char*& pcmBuffer, size_t& pcmSize){
     mpg123_init();
-    mpg123_handle* mh = mpg123_new(nullptr, nullptr);
-    if(!mh){
+    mpg123_handle* mpgHandle = mpg123_new(nullptr, nullptr);
+    if(!mpgHandle){
         cerr << "Unable to initialize mpg123." << endl;
         return false;
     }
 
-    if(mpg123_open_feed(mh) != MPG123_OK){
+    if(mpg123_open_feed(mpgHandle) != MPG123_OK){
         cerr << "Failed to open feed." << endl;
-        mpg123_delete(mh);
+        mpg123_delete(mpgHandle);
         mpg123_exit();
         return false;
     }
 
-    mpg123_format_none(mh);
-    mpg123_format(mh, 44100, MPG123_MONO, MPG123_ENC_SIGNED_16);
+    mpg123_format_none(mpgHandle);
+    mpg123_format(mpgHandle, SAMPLE_FREQUENCY, MPG123_MONO, MPG123_ENC_SIGNED_16);
 
-    size_t bufferSize = 0;
-    size_t done = 0;
+    size_t bufSize = 0;
+    size_t bytesDecoded = 0;
     unsigned char* tempBuffer = nullptr;
     size_t totalDecoded = 0;
 
@@ -560,28 +561,28 @@ bool decodeMP3(const char* mp3Data, size_t mp3Size, char*& pcmBuffer, size_t& pc
 
     while(bytesLeft > 0){
         size_t bytesToFeed = min(bytesLeft, static_cast<size_t>(1024));
-        int feedResult = mpg123_feed(mh, reinterpret_cast<const unsigned char*>(mp3Data + offset), bytesToFeed);
-        if(feedResult != MPG123_OK){
-            cerr << "Feeding MP3 data failed: " << mpg123_strerror(mh) << endl;
-            mpg123_delete(mh);
+        int ret = mpg123_feed(mpgHandle, reinterpret_cast<const unsigned char*>(mp3Data + offset), bytesToFeed);
+        if(ret != MPG123_OK){
+            cerr << "Feeding MP3 data failed: " << mpg123_strerror(mpgHandle) << endl;
+            mpg123_delete(mpgHandle);
             mpg123_exit();
             return false;
         }
 
-        while(mpg123_decode_frame(mh, nullptr, &tempBuffer, &done) == MPG123_OK){
-            pcmBuffer = (char*)realloc(pcmBuffer, bufferSize + done);
-            memcpy(pcmBuffer + bufferSize, tempBuffer, done);
-            bufferSize += done;
-            totalDecoded += done;
+        while(mpg123_decode_frame(mpgHandle, nullptr, &tempBuffer, &bytesDecoded) == MPG123_OK){
+            pcmBuffer = (char*)realloc(pcmBuffer, bufSize + bytesDecoded);
+            memcpy(pcmBuffer + bufSize, tempBuffer, bytesDecoded);
+            bufSize += bytesDecoded;
+            totalDecoded += bytesDecoded;
         }
         
         bytesLeft -= bytesToFeed;
         offset += bytesToFeed;
     }
 
-    pcmSize = bufferSize;
+    pcmSize = bufSize;
     
-    mpg123_delete(mh);
+    mpg123_delete(mpgHandle);
     mpg123_exit();
 
     return true;
@@ -594,18 +595,17 @@ void receiveAndPlayAudio(SSL* ssl){
         return;
     }
 
-    char* mp3Buffer = nullptr;
-    mp3Buffer = new char[fileSize];
+    char* mp3Buffer = new char[fileSize];
 
-    size_t totalReceived = 0;
-    while(totalReceived < fileSize){
-        int bytes = SSL_read(ssl, mp3Buffer + totalReceived, 1024);
-        if(bytes <= 0){
+    size_t bytesReceived = 0;
+    while(bytesReceived < fileSize){
+        int numBytes = SSL_read(ssl, mp3Buffer + bytesReceived, 1024);
+        if(numBytes <= 0){
             cerr << "Failed to read from SSL connection." << endl;
             delete[] mp3Buffer;
             return;
         }
-        totalReceived += bytes;
+        bytesReceived += numBytes;
     }
 
     char* pcmBuffer = nullptr;
@@ -623,13 +623,13 @@ void receiveAndPlayAudio(SSL* ssl){
     // mute portaudio logs
     int saved_stderr = dup(STDERR_FILENO);
     int devnull = open("/dev/null", O_RDWR);
-    dup2(devnull, STDERR_FILENO);  // Replace standard out
+    dup2(devnull, STDERR_FILENO);  // Replace standard error
     Pa_Initialize();
     dup2(saved_stderr, STDERR_FILENO);
 
     AudioData audioData = {pcmBuffer, pcmSize, 0};
     PaStream* stream;
-    if(Pa_OpenDefaultStream(&stream, 0, 1, paInt16, 44100, 512, playAudioCallback, &audioData) != paNoError){
+    if(Pa_OpenDefaultStream(&stream, 0, 1, paInt16, SAMPLE_FREQUENCY, 512, playAudioCallback, &audioData) != paNoError){
         cerr << "Failed to open audio stream." << endl;
         delete[] pcmBuffer;
         Pa_Terminate();
