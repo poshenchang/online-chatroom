@@ -22,25 +22,27 @@ The server acts as a central hub that relays and process messages in between cli
 
 ## Installation and Usage
 
-1. Compile the server and client
+1. Clone the repository
+
+2. Compile the server and client
 
 ```bash
-cd code
+cd online-chatroom
 make
 ```
 
-2. Generate a private key and a self-signed certificate for the server/client:
+3. Generate a private key and a self-signed certificate for the server/client:
 ```bash
 openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes
 ```
 If you want to use existing private key and self-signed certificate, save them in the same directory as the binaries `server`/`client`.
 
-3. Run server with a specified port
+4. Run server with a specified port
 ```bash
 ./server <port>
 ```
 
-4. Start a client with the server's IP address and port
+5. Start a client with the server's IP address and port
 ```bash
 ./client <server-ip> <server-port>
 ```
